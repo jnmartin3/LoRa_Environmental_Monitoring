@@ -1,3 +1,12 @@
+// ============================================================================
+// Código del EMISOR LoRa
+// Implementado en XIAO ESP32 S3 con SX1262 de SeedStudio
+// Sensores:  temperatura DS18B20
+//            presión barometrica BMP180
+//            velocidad de viento Lambrecht serie 14574
+// Funcionamiento: lee datos de sensores cada 10s, arma paquete y envía.
+// ============================================================================
+
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <Wire.h>
