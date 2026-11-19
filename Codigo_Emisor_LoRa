@@ -1,0 +1,159 @@
+#include <Arduino.h>
+#include <RadioLib.h>
+#include <Wire.h>
+#include <Adafruit_BMP085.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ============================================================================
+// 1. CONFIGURACIÓN DE HARDWARE Y SENSORES
+// ============================================================================
+
+const uint8_t PIN_ANEMOMETRO = D3;
+const uint8_t PIN_DS18B20 = D1;
+const float FACTOR_HZ_A_MS = 3.84;
+
+// El período de 10 s reduce el consumo y evita ocupar demasiado tiempo el canal
+// cuando se utiliza SF12, cuyo tiempo de transmisión es considerablemente mayor.
+const unsigned long INTERVALO_MS = 10000UL;
+
+// Pines del módulo Wio-SX1262 conectado al XIAO ESP32S3.
+SX1262 radio = new Module(41, 39, 42, 40);
+
+Adafruit_BMP085 bmp180;
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature sensorDS18B20(&oneWire);
+bool bmp180Disponible = false;
+
+// ============================================================================
+// 2. PARÁMETROS LoRa OPTIMIZADOS PARA LARGA DISTANCIA
+// ============================================================================
+
+// Estos parámetros deben coincidir exactamente con los del receptor.
+const float LORA_FRECUENCIA_MHZ = 915.0;
+const uint8_t LORA_SF = 12;          // Mayor sensibilidad; menor velocidad.
+const float LORA_BW_KHZ = 125.0;     // Ancho estándar y buen compromiso alcance/ruido.
+const uint8_t LORA_CR = 8;           // Coding rate 4/8: más robusto ante errores.
+const uint8_t LORA_PREAMBULO = 12;   // Facilita la sincronización en enlaces débiles.
+const int8_t LORA_POTENCIA_DBM = 20; // Ajustar según antena, módulo y normativa local.
+
+// ============================================================================
+// 3. VARIABLES DE ESTADO
+// ============================================================================
+
+volatile uint32_t contadorPulsos = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+unsigned long tiempoAnterior = 0;
+uint32_t idPaquete = 0;
+
+// ============================================================================
+// 4. INTERRUPCIÓN DEL ANEMÓMETRO
+// ============================================================================
+
+// Se ejecuta en cada flanco de bajada del anemómetro. La sección crítica evita
+// que el loop lea el contador mientras la interrupción lo está modificando.
+void IRAM_ATTR contarPulso() {
+  portENTER_CRITICAL_ISR(&mux);
+  contadorPulsos++;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+// ============================================================================
+// 5. INICIALIZACIÓN
+// ============================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // Anemómetro: cada pulso representa una cantidad de vueltas del rotor.
+  pinMode(PIN_ANEMOMETRO, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_ANEMOMETRO), contarPulso, FALLING);
+
+  // Sensores ambientales.
+  sensorDS18B20.begin();
+  bmp180Disponible = bmp180.begin();
+  if (!bmp180Disponible) {
+    Serial.println("Error: BMP180 no detectado");
+  }
+
+  // Radio LoRa. SF12, CR 4/8, preámbulo largo y CRC priorizan alcance y
+  // confiabilidad sobre velocidad. El receptor debe usar la misma configuración.
+  radio.setDio2AsRfSwitch(true);
+  int state = radio.begin(LORA_FRECUENCIA_MHZ);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setSpreadingFactor(LORA_SF);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setBandwidth(LORA_BW_KHZ);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setCodingRate(LORA_CR);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setPreambleLength(LORA_PREAMBULO);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setCRC(true);
+  if (state == RADIOLIB_ERR_NONE) state = radio.setOutputPower(LORA_POTENCIA_DBM);
+
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("Error LoRa TX: ");
+    Serial.println(state);
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  tiempoAnterior = millis();
+  Serial.println("Emisor LoRa iniciado para larga distancia");
+}
+
+// ============================================================================
+// 6. MEDICIÓN, ARMADO Y TRANSMISIÓN DEL PAQUETE
+// ============================================================================
+
+void loop() {
+  const unsigned long tiempoActual = millis();
+
+  // Se toma una muestra periódica de todos los sensores y se envía un paquete.
+  if (tiempoActual - tiempoAnterior >= INTERVALO_MS) {
+    // Copiar y poner en cero el contador de pulsos de forma atómica.
+    portENTER_CRITICAL(&mux);
+    const uint32_t pulsos = contadorPulsos;
+    contadorPulsos = 0;
+    portEXIT_CRITICAL(&mux);
+
+    const float segundos = (tiempoActual - tiempoAnterior) / 1000.0;
+    tiempoAnterior = tiempoActual;
+
+    // Cálculo de velocidad a partir de la frecuencia de pulsos.
+    const float frecuenciaHz = pulsos / segundos;
+    const float velocidadMs = frecuenciaHz / FACTOR_HZ_A_MS;
+    const float velocidadKmh = velocidadMs * 3.6;
+
+    // Lectura del DS18B20.
+    sensorDS18B20.requestTemperatures();
+    const float temperaturaDS18B20 = sensorDS18B20.getTempCByIndex(0);
+    const bool ds18b20Disponible = temperaturaDS18B20 != DEVICE_DISCONNECTED_C;
+
+    // Lectura del BMP180: temperatura en °C y presión convertida a hPa.
+    float temperaturaBMP180 = 0.0;
+    float presionBMP180 = 0.0;
+    if (bmp180Disponible) {
+      temperaturaBMP180 = bmp180.readTemperature();
+      presionBMP180 = bmp180.readPressure() / 100.0;
+    }
+
+    idPaquete++;
+
+    // Formato compacto para reducir el tiempo de aire y conservar la autonomía.
+    String mensaje = "ID:" + String(idPaquete) +
+                     ",RUTA:DIR" +
+                     ",HZ:" + String(frecuenciaHz, 2) +
+                     ",MS:" + String(velocidadMs, 2) +
+                     ",KMH:" + String(velocidadKmh, 2) +
+                     ",TDS:" + (ds18b20Disponible ? String(temperaturaDS18B20, 2) : "ERR") +
+                     ",TBMP:" + (bmp180Disponible ? String(temperaturaBMP180, 2) : "ERR") +
+                     ",PRES:" + (bmp180Disponible ? String(presionBMP180, 2) : "ERR");
+
+    Serial.print("Enviando -> ");
+    Serial.println(mensaje);
+
+    const int estadoTX = radio.transmit(mensaje);
+    if (estadoTX != RADIOLIB_ERR_NONE) {
+      Serial.print("Error de transmisión: ");
+      Serial.println(estadoTX);
+    }
+  }
+}
