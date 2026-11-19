@@ -1,0 +1,107 @@
+#include <Arduino.h>
+#include <RadioLib.h>
+
+// ============================================================================
+// CONFIGURACION LoRa
+// ============================================================================
+// Estos valores deben ser iguales en el emisor y en el receptor.
+const float LORA_FRECUENCIA_MHZ = 915.0;
+const uint8_t LORA_SF = 12;
+const float LORA_BW_KHZ = 125.0;
+const uint8_t LORA_CR = 8;
+const uint16_t LORA_PREAMBULO = 12;
+const int8_t LORA_POTENCIA_DBM = 20;
+
+// ============================================================================
+// CONFIGURACION DEL HARDWARE
+// ============================================================================
+// Pines del Seeed XIAO ESP32S3 + Wio-SX1262 (conector B2B).
+SX1262 radio = new Module(41, 39, 42, 40);
+
+// Para un RFM95/SX1276, comenta la linea anterior y descomenta esta:
+// SX1276 radio = new Module(D4, D1, D2, RADIOLIB_NC);
+
+// Bandera modificada por la interrupcion cuando llega un paquete.
+volatile bool paqueteRecibido = false;
+
+// ============================================================================
+// RUTINA DE INTERRUPCION
+// ============================================================================
+// La ISR solo marca una bandera; la lectura se hace luego en loop().
+void IRAM_ATTR alRecibir() {
+  paqueteRecibido = true;
+}
+
+// ============================================================================
+// INICIALIZACION
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);  // Da tiempo a que la PC abra el puerto serie.
+
+  Serial.println("[LoRa RX] Iniciando receptor...");
+
+  // El Wio-SX1262 usa DIO2 para controlar el switch interno de RF.
+  radio.setDio2AsRfSwitch(true);
+
+  // Inicializa el transceptor en la frecuencia del emisor.
+  int state = radio.begin(LORA_FRECUENCIA_MHZ);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("Error de inicio, codigo: ");
+    Serial.println(state);
+    while (true) {
+      delay(100);
+    }
+  }
+
+  // Configura exactamente los parametros de modulacion del emisor.
+  radio.setSpreadingFactor(LORA_SF);
+  radio.setBandwidth(LORA_BW_KHZ);
+  radio.setCodingRate(LORA_CR);          // CR 4/8.
+  radio.setPreambleLength(LORA_PREAMBULO);
+
+  // En RX no cambia la sensibilidad, pero deja documentada la configuracion.
+  radio.setOutputPower(LORA_POTENCIA_DBM);
+
+  // Conecta la interrupcion y comienza a escuchar continuamente.
+  radio.setPacketReceivedAction(alRecibir);
+  radio.startReceive();
+
+  Serial.println("[LoRa RX] OK. Esperando datos...");
+}
+
+// ============================================================================
+// BUCLE PRINCIPAL DE RECEPCION
+// ============================================================================
+void loop() {
+  // No bloquea el microcontrolador mientras no haya un paquete nuevo.
+  if (!paqueteRecibido) {
+    return;
+  }
+
+  // Limpia la bandera antes de leer para poder detectar el siguiente paquete.
+  paqueteRecibido = false;
+
+  String datosRecibidos;
+  int state = radio.readData(datosRecibidos);
+
+  if (state == RADIOLIB_ERR_NONE) {
+    // Muestra el mensaje y la calidad del enlace.
+    Serial.print(datosRecibidos);
+    Serial.print(" | RSSI: ");
+    Serial.print(radio.getRSSI());
+    Serial.print(" dBm | SNR: ");
+    Serial.print(radio.getSNR());
+    Serial.println(" dB");
+  } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+    // El paquete llego, pero fallo la comprobacion de integridad.
+    Serial.println("Error: Paquete corrupto (CRC)");
+  } else {
+    // Informa otros errores para facilitar el diagnostico.
+    Serial.print("Error de lectura, codigo: ");
+    Serial.println(state);
+  }
+
+  // Reactiva el modo de recepcion para esperar el siguiente paquete.
+  radio.startReceive();
+}
