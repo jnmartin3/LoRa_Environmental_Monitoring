@@ -1,0 +1,186 @@
+// ============================================================================
+// Código del REPETIDOR LoRa
+// Implementado en HELTEC V4
+// Funcionamiento: recibe datos del emisor/es y retransmite en misma frecuencia.
+//                 Para identificar que el mensaje fue retransmitido por este 
+//                 equipo se cambia la Ruta de DIR a REP.
+// ============================================================================
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+
+// ============================================================================
+// CONFIGURACION LoRa
+// ============================================================================
+// Estos parametros deben coincidir con los del emisor y del receptor final.
+const float LORA_FRECUENCIA_MHZ = 915.0;
+const uint8_t LORA_SF = 12;
+const float LORA_BW_KHZ = 125.0;
+const uint8_t LORA_CR = 8;          // Coding rate 4/8.
+const uint8_t LORA_PREAMBULO = 12;
+const int8_t LORA_POTENCIA_DBM = 20;
+
+// ============================================================================
+// PINES DEL HELTEC WIFI LoRa 32 V3/V4
+// ============================================================================
+// Pines SPI y control del transceptor SX1262.
+#define LORA_SCK   9
+#define LORA_MISO  11
+#define LORA_MOSI  10
+#define LORA_NSS   8
+#define LORA_DIO1  14
+#define LORA_NRST  12
+#define LORA_BUSY  13
+
+// Pines de habilitacion del amplificador RF del Heltec V4.
+#define HELTEC_V4_VFEM   2
+#define HELTEC_V4_PA_EN  7
+
+// ============================================================================
+// OBJETOS Y VARIABLES DEL REPETIDOR
+// ============================================================================
+SPIClass spiLoRa(FSPI);
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY, spiLoRa);
+
+// La interrupcion solo activa esta bandera. La recepcion y retransmision se
+// ejecutan en loop(), fuera del contexto de la interrupcion.
+volatile bool paqueteRecibido = false;
+
+// Guarda el ultimo ID repetido para evitar retransmisiones duplicadas.
+String ultimoIdRepetido = "";
+
+// ============================================================================
+// INTERRUPCION DE RECEPCION
+// ============================================================================
+void IRAM_ATTR alRecibir() {
+  paqueteRecibido = true;
+}
+
+// ============================================================================
+// EXTRACCION DEL IDENTIFICADOR DEL MENSAJE
+// ============================================================================
+// Busca el campo ID:xxxx dentro de la trama y devuelve solo su valor.
+// Si no existe un ID, devuelve la trama completa como identificador.
+String obtenerId(const String& trama) {
+  const String prefijo = "ID:";
+  int inicio = trama.indexOf(prefijo);
+
+  if (inicio < 0) {
+    return trama;
+  }
+
+  inicio += prefijo.length();
+  int fin = trama.indexOf(',', inicio);
+  if (fin < 0) {
+    fin = trama.length();
+  }
+
+  return trama.substring(inicio, fin);
+}
+
+// ============================================================================
+// INICIALIZACION DEL REPETIDOR
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);  // Tiempo para abrir el monitor serie.
+
+  // Enciende la etapa de radiofrecuencia del Heltec V4.
+  pinMode(HELTEC_V4_VFEM, OUTPUT);
+  digitalWrite(HELTEC_V4_VFEM, HIGH);
+  pinMode(HELTEC_V4_PA_EN, OUTPUT);
+  digitalWrite(HELTEC_V4_PA_EN, HIGH);
+
+  // Inicializa el bus SPI con los pines utilizados por el modulo LoRa.
+  spiLoRa.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  Serial.println("[Heltec V4 Repetidor] Iniciando LoRa...");
+
+  // El SX1262 del Heltec utiliza DIO2 para controlar el switch interno de RF.
+  radio.setDio2AsRfSwitch(true);
+
+  // Inicializa el transceptor en la frecuencia del enlace.
+  int state = radio.begin(LORA_FRECUENCIA_MHZ);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("Error de inicio, codigo: ");
+    Serial.println(state);
+    while (true) {
+      delay(100);
+    }
+  }
+
+  // Configura la modulacion exactamente igual que emisor y receptor.
+  radio.setSpreadingFactor(LORA_SF);
+  radio.setBandwidth(LORA_BW_KHZ);
+  radio.setCodingRate(LORA_CR);
+  radio.setPreambleLength(LORA_PREAMBULO);
+  radio.setOutputPower(LORA_POTENCIA_DBM);
+
+  // Activa la interrupcion y deja el repetidor esperando paquetes.
+  radio.setPacketReceivedAction(alRecibir);
+  radio.startReceive();
+
+  Serial.println("[LoRa Repetidor] Listo. Esperando mensajes...");
+}
+
+// ============================================================================
+// RECEPCION, FILTRADO Y RETRANSMISION
+// ============================================================================
+void loop() {
+  // Si no llego ningun paquete, vuelve inmediatamente a revisar la bandera.
+  if (!paqueteRecibido) {
+    return;
+  }
+
+  // Limpia la bandera antes de procesar el paquete actual.
+  paqueteRecibido = false;
+
+  String trama;
+  int state = radio.readData(trama);
+
+  if (state == RADIOLIB_ERR_NONE) {
+    // Solo se repiten mensajes originales para evitar bucles infinitos.
+    if (trama.indexOf("RUTA:DIR") < 0) {
+      Serial.println("Paquete ignorado: no es una trama original.");
+      radio.startReceive();
+      return;
+    }
+
+    // Obtiene el identificador y descarta duplicados consecutivos.
+    String idActual = obtenerId(trama);
+    if (idActual == ultimoIdRepetido) {
+      Serial.println("Paquete duplicado ignorado.");
+      radio.startReceive();
+      return;
+    }
+
+    ultimoIdRepetido = idActual;
+
+    // Cambia la ruta para indicar que el mensaje fue retransmitido.
+    trama.replace("RUTA:DIR", "RUTA:REP");
+
+    Serial.print("Retransmitiendo -> ");
+    Serial.println(trama);
+
+    // RadioLib cambia temporalmente a transmision y devuelve un codigo de
+    // estado. No hace falta una espera fija: readData ya finalizo la recepcion.
+    state = radio.transmit(trama);
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.print("Error de retransmision, codigo: ");
+      Serial.println(state);
+    } else {
+      Serial.println("Retransmision completada.");
+    }
+  } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+    // Descarta paquetes con errores de integridad.
+    Serial.println("Paquete recibido con CRC incorrecto.");
+  } else {
+    // Informa otros errores para facilitar el diagnostico.
+    Serial.print("Error de recepcion, codigo: ");
+    Serial.println(state);
+  }
+
+  // Vuelve al modo recepcion despues de procesar o transmitir.
+  radio.startReceive();
+}
