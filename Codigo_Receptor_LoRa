@@ -1,3 +1,9 @@
+// ============================================================================
+// Código del RECEPTOR LoRa
+// Implementado en XIAO ESP32 S3 con SX1262 de SeedStudio
+// Funcionamiento: recibe datos del emisor/es e imprime en Serial.
+// ============================================================================
+
 #include <Arduino.h>
 #include <RadioLib.h>
 
